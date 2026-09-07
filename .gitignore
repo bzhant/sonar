@@ -27,3 +27,4 @@ Thumbs.db
 
 # Config (may contain cookies/tokens)
 config.json
+main_qt.py

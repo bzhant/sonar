@@ -2,6 +2,24 @@
 
 LLM 驱动的 B站 & 贴吧舆情分析工具。接入任意 OpenAI 兼容 API，LLM 通过**函数调用（Function Calling）自主决定采集哪些数据**，最终生成结构化舆情分析报告。
 
+## 为什么选 Sonar？
+
+**够傻瓜——全过程只需要点几下鼠标。**
+
+你不需要懂爬虫、不需要手动复制 Cookie、不需要写任何代码：
+
+1. 打开软件，填一次 API Key（内置 DeepSeek / 通义千问等预设，点一下自动填好）
+2. 点一下「🔍 一键获取Cookie」——自动从本机浏览器提取 B站 / 贴吧登录凭证（前提：浏览器里已登录）
+3. 输入关键词或视频链接，点「🚀 一键分析」
+
+完事。剩下的搜索、翻页、抓评论、总结观点，全部由 LLM 自主完成。
+
+| 传统舆情工具 | Sonar |
+|------|------|
+| 手动登录抓 Cookie，F12 复制粘贴 | 点一下按钮，自动从浏览器提取 |
+| 手动配置爬虫参数、页数、翻页规则 | LLM 自己决定查什么、查多少 |
+| 采完数据还要自己看、自己总结 | 直接输出舆论偏向、情绪、主要观点的成品报告 |
+
 ## 功能特性
 
 ### 三种分析模式
@@ -14,14 +32,11 @@ LLM 驱动的 B站 & 贴吧舆情分析工具。接入任意 OpenAI 兼容 API�
 
 ### 核心能力
 
+- **一键获取 Cookie**：自动从本机浏览器（Chrome / Edge 等）提取 B站 / 贴吧登录 Cookie，无需 F12 手动复制；也支持一键打开登录页面辅助获取
 - **LLM 自主采集**：通过 OpenAI Function Calling，LLM 像Agent一样自主调用采集工具（搜索、抓评论、查视频详情），按需决定数据量
 - **双平台支持**：B站（搜索 / 评论 / 视频详情）+ 贴吧（搜索 / 回复），无需手动爬虫配置
-- **自动 Cookie**：一键从本机浏览器提取 B站 / 贴吧 Cookie（基于 browser_cookie3）
-- **传统模式回退**：API 不支持函数调用时，自动回退为固定流程采集 + 单轮总结
+- **传统模式回退**：API 不支持函数调用时，自动回退为固定流程采集 + 单轮总结，照样能出报告
 - **报告导出**：分析报告、原始数据均可导出为文件
-- **双 GUI 版本**：
-  - `main.py` — Tkinter 暗色主题界面
-  - `main_qt.py` — PySide6 苹果质感界面（浅色卡片风格）
 
 ## 快速开始
 
@@ -31,26 +46,17 @@ LLM 驱动的 B站 & 贴吧舆情分析工具。接入任意 OpenAI 兼容 API�
 pip install -r requirements.txt
 ```
 
-> Tkinter 版无需 PySide6；运行 `main_qt.py` 需要完整依赖。
-
 ### 运行
 
 ```bash
-# Tkinter 暗色版
 python main.py
-
-# PySide6 苹果质感版
-python main_qt.py
 ```
 
-### 配置
+### 配置（仅需一次）
 
 1. 打开应用 → **设置页**
-2. 填入任意 **OpenAI 兼容 API**（内置预设：DeepSeek / 通义千问 / OpenAI / Moonshot）：
-   - API 地址（如 `https://api.deepseek.com/v1`）
-   - API Key
-   - 模型名（如 `deepseek-chat`，需支持函数调用）
-3. 点击「一键获取Cookie」自动从浏览器提取（需已在浏览器登录 B站），贴吧同理
+2. 点内置预设（DeepSeek / 通义千问 / OpenAI / Moonshot）自动填入 API 地址和模型名，再粘贴你的 API Key
+3. 点击「🔍 一键获取Cookie」自动从浏览器提取（需已在浏览器登录 B站），贴吧同理
 4. 回到主页，选择分析模式，输入关键词或 BV号 → **一键分析**
 
 ### 打包为 exe
@@ -62,12 +68,11 @@ pyinstaller --onefile --windowed --name "声呐Sonar" main.py
 ## 项目结构
 
 ```
-├── main.py               # Tkinter 主程序（暗色主题 GUI）
-├── main_qt.py            # PySide6 主程序（苹果质感 GUI）
+├── main.py               # 主程序（GUI）
 ├── llm_analyzer.py       # LLM 分析核心（函数调用循环 + 三种分析模式）
 ├── bilibili_collector.py # B站采集（搜索/评论/视频详情，WBI签名）
 ├── tieba_collector.py    # 贴吧采集（搜索/回复）
-├── cookie_helper.py      # 浏览器 Cookie 提取
+├── cookie_helper.py      # 一键获取 Cookie（浏览器 Cookie 提取）
 ├── config_manager.py     # 配置持久化
 └── requirements.txt      # 依赖清单
 ```
