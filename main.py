@@ -14,8 +14,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config_manager import ConfigManager
 from bilibili_collector import BilibiliCollector
 from tieba_collector import TiebaCollector
-from llm_analyzer import LLMAnalyzer, FunctionCallingNotSupported
+from llm_analyzer import LLMAnalyzer, FunctionCallingNotSupported, AnalysisCancelled
 import cookie_helper
+import md_render
+from history import save_analysis, open_history_folder
 
 # ========== 暗色主题配色 ==========
 THEME = {
@@ -151,7 +153,10 @@ class AnalyzerApp:
         self.current_keyword = ""
         self._current_page = "main"
         self._analyzing = False
+        self._cancel_event = threading.Event()  # 停止分析请求，工作线程在检查点响应
         self.analysis_mode = "keyword"  # "keyword" | "single_video" | "bili_overview"
+        self._report_stream_buf = ""  # 流式报告的原始文本缓冲
+        self.report_render_var = tk.BooleanVar(value=True)  # 报告渲染预览开关
 
         apply_theme(self.root)
         self._build_ui()
@@ -493,6 +498,26 @@ class AnalyzerApp:
         # 分析报告
         report_frame = tk.Frame(notebook, bg=THEME["bg"])
         notebook.add(report_frame, text="  📊 分析报告  ")
+        report_toolbar = tk.Frame(report_frame, bg=THEME["bg"])
+        report_toolbar.pack(fill="x", padx=4, pady=(4, 0))
+        tk.Checkbutton(
+            report_toolbar, text="渲染预览", variable=self.report_render_var,
+            command=self._render_report, bg=THEME["bg"], fg=THEME["text_dim"],
+            activebackground=THEME["bg"], activeforeground=THEME["accent"],
+            selectcolor=THEME["bg_input"], font=(THEME["font"], 9),
+        ).pack(side="left")
+        tk.Button(
+            report_toolbar, text="📋 复制报告", bg=THEME["bg_input"], fg=THEME["text"],
+            activebackground=THEME["bg_hover"], font=(THEME["font"], 9),
+            bd=1, relief="solid", padx=10, pady=2, cursor="hand2",
+            command=self._copy_report,
+        ).pack(side="left", padx=(12, 4))
+        tk.Button(
+            report_toolbar, text="📂 历史归档", bg=THEME["bg_input"], fg=THEME["text"],
+            activebackground=THEME["bg_hover"], font=(THEME["font"], 9),
+            bd=1, relief="solid", padx=10, pady=2, cursor="hand2",
+            command=self._open_history_folder,
+        ).pack(side="left", padx=4)
         self.report_text = scrolledtext.ScrolledText(
             report_frame, bg=THEME["bg_card"], fg=THEME["text"],
             insertbackground=THEME["text"], font=(THEME["font"], 10),
@@ -970,8 +995,9 @@ class AnalyzerApp:
     # ========== 核心分析流程（LLM 驱动）==========
 
     def _start_analysis(self):
-        """启动 LLM 驱动的分析流程"""
+        """启动 LLM 驱动的分析流程；分析进行中再次点击则请求停止"""
         if self._analyzing:
+            self._request_cancel()
             return
         self._update_config_from_ui()
 
@@ -1005,7 +1031,9 @@ class AnalyzerApp:
             self._log("B站未配置 Cookie，请在设置页填写", "warning")
 
         self._analyzing = True
-        self.analyze_btn.config(state="disabled", text="分析中...")
+        self._cancel_event.clear()
+        self.analyze_btn.config(text="⛔  停止分析", bg=THEME["error"],
+                                activebackground="#c23e3e", activeforeground="#ffffff")
         self.clear_btn.config(state="disabled")
         self._clear_data()
         self._set_status("● LLM 分析中...")
@@ -1014,15 +1042,28 @@ class AnalyzerApp:
         bili_cookie = self.config.get_bilibili_cookie_str() if use_bili else ""
         tieba_cookie = self.config.get_tieba_cookie_str() if use_tieba else ""
 
+        # 在主线程预先读取采集参数，避免工作线程跨线程访问 Tkinter 控件
+        try:
+            bili_max_pages = int(self.bili_pages_s.get())
+            bili_comments = int(self.bili_comments_s.get())
+            tieba_max_pages = int(self.tieba_pages_s.get())
+            tieba_replies = int(self.tieba_replies_s.get())
+        except (ValueError, tk.TclError):
+            bili_max_pages, bili_comments = 2, 30
+            tieba_max_pages, tieba_replies = 3, 20
+
         mode_names = {"keyword": "关键词综合分析", "single_video": "单视频深度分析", "bili_overview": "B站相关视频概览"}
         self._activity("开始分析", f"[{mode_names.get(mode, '')}] {self.current_keyword}", "info")
 
         def _do():
+            done_status = "error"
+            analyzer = None
             try:
                 analyzer = LLMAnalyzer(
                     self.config.get("llm", "api_base"),
                     self.config.get("llm", "api_key"),
                     self.config.get("llm", "model"),
+                    cancel_event=self._cancel_event,
                 )
 
                 def on_tool_call(name, args):
@@ -1036,6 +1077,20 @@ class AnalyzerApp:
                     if text and len(text) < 200:
                         self.message_queue.put(("activity", f"🤔 {text[:100]}", "think"))
 
+                def report_usage():
+                    """完成时汇报本次分析的 LLM token 用量"""
+                    u = analyzer.usage
+                    if u.get("total_tokens"):
+                        self.message_queue.put(("activity",
+                            f"📊 LLM 用量: {u['total_tokens']} tokens"
+                            f"（请求 {u['requests']} 次，输入 {u['prompt_tokens']} / 输出 {u['completion_tokens']}）", "info"))
+
+                def on_report_reset():
+                    self.message_queue.put(("report_reset", ""))
+
+                def on_report_delta(text):
+                    self.message_queue.put(("report_delta", text))
+
                 try:
                     if mode == "keyword":
                         result = analyzer.analyze_agentic(
@@ -1047,6 +1102,8 @@ class AnalyzerApp:
                             on_tool_call=on_tool_call,
                             on_tool_result=on_tool_result,
                             on_thinking=on_thinking,
+                            on_report_reset=on_report_reset,
+                            on_report_delta=on_report_delta,
                         )
                     elif mode == "single_video":
                         result = analyzer.analyze_single_video(
@@ -1055,6 +1112,8 @@ class AnalyzerApp:
                             on_tool_call=on_tool_call,
                             on_tool_result=on_tool_result,
                             on_thinking=on_thinking,
+                            on_report_reset=on_report_reset,
+                            on_report_delta=on_report_delta,
                         )
                     elif mode == "bili_overview":
                         result = analyzer.analyze_bili_overview(
@@ -1063,6 +1122,8 @@ class AnalyzerApp:
                             on_tool_call=on_tool_call,
                             on_tool_result=on_tool_result,
                             on_thinking=on_thinking,
+                            on_report_reset=on_report_reset,
+                            on_report_delta=on_report_delta,
                         )
 
                     self.bilibili_data = result.get("bilibili_data")
@@ -1072,20 +1133,27 @@ class AnalyzerApp:
                     if self.tieba_data:
                         self.message_queue.put(("data_ready", "tieba"))
                     self.message_queue.put(("report", self.analysis_report))
+                    report_usage()
                     self.message_queue.put(("activity", "✅ 分析完成！", "result"))
                     self.message_queue.put(("log", f"{mode_names.get(mode, '')}完成", "success"))
-                    self.message_queue.put(("done", "complete"))
+                    done_status = "complete"
+
+                except AnalysisCancelled:
+                    raise
 
                 except FunctionCallingNotSupported:
                     self.message_queue.put(("activity", "⚠ API不支持函数调用，回退到传统模式", "think"))
                     self.message_queue.put(("log", "API不支持函数调用，使用传统模式", "warning"))
                     if mode == "keyword":
-                        bili_data, tieba_data = self._traditional_collect(self.current_keyword, use_bili, use_tieba)
+                        bili_data, tieba_data = self._traditional_collect(
+                            self.current_keyword, use_bili, use_tieba,
+                            bili_max_pages, bili_comments, tieba_max_pages, tieba_replies)
                     elif mode == "single_video":
                         bili_data = self._traditional_collect_single_video(self.current_keyword)
                         tieba_data = None
                     else:
-                        bili_data = self._traditional_collect_bili_overview(self.current_keyword)
+                        bili_data = self._traditional_collect_bili_overview(
+                            self.current_keyword, bili_max_pages, bili_comments)
                         tieba_data = None
 
                     if bili_data:
@@ -1097,30 +1165,58 @@ class AnalyzerApp:
                     self.message_queue.put(("activity", "采集完成，正在分析...", "info"))
 
                     if mode == "keyword":
-                        report = analyzer.analyze_traditional(self.current_keyword, bili_data, tieba_data)
+                        report = analyzer.analyze_traditional(
+                            self.current_keyword, bili_data, tieba_data,
+                            on_report_reset=on_report_reset, on_report_delta=on_report_delta)
                     else:
-                        report = analyzer.analyze_traditional(self.current_keyword, bili_data, None)
+                        report = analyzer.analyze_traditional(
+                            self.current_keyword, bili_data, None,
+                            on_report_reset=on_report_reset, on_report_delta=on_report_delta)
                     self.analysis_report = report
                     self.message_queue.put(("report", report))
+                    report_usage()
                     self.message_queue.put(("activity", "✅ 分析完成（传统模式）！", "result"))
                     self.message_queue.put(("log", "传统模式分析完成", "success"))
-                    self.message_queue.put(("done", "complete"))
+                    done_status = "complete"
 
+            except AnalysisCancelled:
+                self.message_queue.put(("activity", "⛔ 分析已被手动停止", "error"))
+                self.message_queue.put(("log", "分析已手动停止", "warning"))
+                done_status = "cancelled"
             except Exception as e:
                 self.message_queue.put(("activity", f"❌ 分析失败: {e}", "error"))
                 self.message_queue.put(("log", f"分析出错: {e}", "error"))
-                self.message_queue.put(("done", "error"))
+                done_status = "error"
+            finally:
+                # 归档本次分析报告（取消/出错时若有部分报告也保留）
+                if analyzer is not None and self.analysis_report:
+                    try:
+                        report_path = save_analysis(
+                            mode_names.get(mode, mode), self.current_keyword,
+                            self.analysis_report, analyzer.usage,
+                            self.bilibili_data, self.tieba_data)
+                        self.message_queue.put(("log", f"报告已归档: {report_path}", "info"))
+                    except Exception as e:
+                        self.message_queue.put(("log", f"归档失败: {e}", "warning"))
+                # 无论成功、出错还是取消，都通知 UI 复位状态，避免按钮永久禁用
+                self.message_queue.put(("done", done_status))
 
         threading.Thread(target=_do, daemon=True).start()
 
-    def _traditional_collect(self, keyword, use_bili, use_tieba):
-        """传统模式采集数据（回退用）"""
+    def _request_cancel(self):
+        """请求停止当前分析，工作线程会在下一个检查点退出"""
+        if not self._analyzing:
+            return
+        self._cancel_event.set()
+        self.analyze_btn.config(state="disabled", text="正在停止...")
+        self._set_status("● 正在停止...")
+
+    def _traditional_collect(self, keyword, use_bili, use_tieba,
+                             bili_max_pages=2, bili_comments=30,
+                             tieba_max_pages=3, tieba_replies=20):
+        """传统模式采集数据（回退用）。采集参数由主线程预先读取后传入。"""
         bili_data = None
         tieba_data = None
-        bili_max_pages = int(self.bili_pages_s.get())
-        bili_comments = int(self.bili_comments_s.get())
-        tieba_max_pages = int(self.tieba_pages_s.get())
-        tieba_replies = int(self.tieba_replies_s.get())
 
         if use_bili:
             self.message_queue.put(("activity", "正在采集B站数据...", "info"))
@@ -1132,6 +1228,9 @@ class AnalyzerApp:
                     f"  ✓ B站: {bili_data['total_videos']}视频, {bili_data['total_comments']}评论", "result"))
             except Exception as e:
                 self.message_queue.put(("activity", f"  ❌ B站采集失败: {e}", "error"))
+
+        if self._cancel_event.is_set():
+            raise AnalysisCancelled("分析已被用户手动停止")
 
         if use_tieba:
             self.message_queue.put(("activity", "正在采集贴吧数据...", "info"))
@@ -1161,6 +1260,8 @@ class AnalyzerApp:
             self.message_queue.put(("activity", "正在获取评论...", "info"))
             comments = []
             for page in range(1, 4):
+                if self._cancel_event.is_set():
+                    raise AnalysisCancelled("分析已被用户手动停止")
                 try:
                     page_comments = collector.get_video_comments(info["aid"], page=page, ps=20)
                     if not page_comments:
@@ -1182,10 +1283,8 @@ class AnalyzerApp:
             self.message_queue.put(("activity", f"  ❌ 视频采集失败: {e}", "error"))
             return None
 
-    def _traditional_collect_bili_overview(self, keyword):
-        """传统模式：B站概览采集（回退用）"""
-        bili_max_pages = int(self.bili_pages_s.get())
-        bili_comments = int(self.bili_comments_s.get())
+    def _traditional_collect_bili_overview(self, keyword, bili_max_pages=2, bili_comments=30):
+        """传统模式：B站概览采集（回退用）。采集参数由主线程预先读取后传入。"""
         self.message_queue.put(("activity", "正在搜索B站相关视频...", "info"))
         try:
             collector = BilibiliCollector(self.config.get_bilibili_cookie_str())
@@ -1203,7 +1302,7 @@ class AnalyzerApp:
         if name == "search_bilibili":
             return f"搜索B站「{args.get('keyword', '?')}」(第{args.get('page', 1)}页)"
         elif name == "get_bilibili_comments":
-            return f"获取B站评论(av{args.get('aid', '?')}, 限{args.get('limit', 20)}条)"
+            return f"获取B站评论(av{args.get('aid', '?')}, 第{args.get('page', 1)}页, 限{args.get('limit', 20)}条)"
         elif name == "get_video_info":
             return f"获取视频详情({args.get('bvid', '?')})"
         elif name == "search_tieba":
@@ -1243,17 +1342,46 @@ class AnalyzerApp:
         self.status_var.set(text)
 
     def _set_report(self, text):
-        """设置报告内容"""
+        """设置报告内容（按渲染预览开关决定显示方式）"""
+        self._report_raw = text
+        self._render_report()
+
+    def _render_report(self):
+        """根据开关重新渲染报告区域：Markdown 渲染预览或 Markdown 原文"""
+        text = getattr(self, "_report_raw", "")
         self.report_text.config(state="normal")
         self.report_text.delete("1.0", "end")
-        self.report_text.insert("1.0", text)
+        if text:
+            if self.report_render_var.get():
+                md_render.render_markdown(self.report_text, text, THEME)
+            else:
+                self.report_text.insert("1.0", text)
         self.report_text.config(state="disabled")
+        self.report_text.see("end")
+
+    def _copy_report(self):
+        """复制当前报告原文到剪贴板"""
+        text = getattr(self, "_report_raw", "")
+        if not text:
+            self._show_toast("当前没有报告可复制", "warning")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._show_toast("报告已复制到剪贴板", "success")
+
+    def _open_history_folder(self):
+        """打开历史归档目录"""
+        try:
+            open_history_folder()
+        except Exception as e:
+            self._show_toast(f"打开历史目录失败: {e}", "error")
 
     def _clear_data(self):
         """清空采集数据"""
         self.bilibili_data = None
         self.tieba_data = None
         self.analysis_report = ""
+        self._report_stream_buf = ""
         self.bili_tree.delete(*self.bili_tree.get_children())
         self.bili_comment_tree.delete(*self.bili_comment_tree.get_children())
         self.tieba_tree.delete(*self.tieba_tree.get_children())
@@ -1354,7 +1482,23 @@ class AnalyzerApp:
                     self._set_status(f"● {msg_parts[0]}")
 
                 elif msg_type == "report":
-                    self._set_report(msg_parts[0])
+                    self.analysis_report = msg_parts[0]
+                    self._report_stream_buf = self.analysis_report
+                    self._set_report(self.analysis_report)
+
+                elif msg_type == "report_reset":
+                    self._report_stream_buf = ""
+                    self.report_text.config(state="normal")
+                    self.report_text.delete("1.0", "end")
+                    self.report_text.config(state="disabled")
+
+                elif msg_type == "report_delta":
+                    self._report_stream_buf += msg_parts[0]
+                    self.analysis_report = self._report_stream_buf
+                    self.report_text.config(state="normal")
+                    self.report_text.insert("end", msg_parts[0])
+                    self.report_text.config(state="disabled")
+                    self.report_text.see("end")
 
                 elif msg_type == "data_ready":
                     platform = msg_parts[0]
@@ -1393,13 +1537,18 @@ class AnalyzerApp:
 
                 elif msg_type == "done":
                     self._analyzing = False
-                    self.analyze_btn.config(state="normal", text="🚀  一键分析")
+                    self.analyze_btn.config(state="normal", text="🚀  一键分析",
+                                            bg=THEME["accent"],
+                                            activebackground=THEME["accent_dim"],
+                                            activeforeground="#ffffff")
                     self.clear_btn.config(state="normal")
                     status = msg_parts[0] if msg_parts else ""
                     if status == "complete":
                         self._set_status("● 完成")
                     elif status == "error":
                         self._set_status("● 出错")
+                    elif status == "cancelled":
+                        self._set_status("● 已停止")
 
         except queue.Empty:
             pass
