@@ -36,6 +36,10 @@ LLM 驱动的 B站 & 贴吧舆情分析工具。接入任意 OpenAI 兼容 API�
 - **LLM 自主采集**：通过 OpenAI Function Calling，LLM 像Agent一样自主调用采集工具（搜索、抓评论、查视频详情），按需决定数据量
 - **双平台支持**：B站（搜索 / 评论 / 视频详情）+ 贴吧（搜索 / 回复），无需手动爬虫配置
 - **传统模式回退**：API 不支持函数调用时，自动回退为固定流程采集 + 单轮总结，照样能出报告
+- **报告流式输出**：报告生成过程实时逐字显示，无需空等；服务端不支持流式时自动降级
+- **Markdown 报告渲染**：标题 / 表格 / 引用 / 代码块一键渲染预览，支持一键复制原文
+- **分析历史归档**：每次分析自动保存报告与原始数据到 `~/.sonar/history/`，可随时回看
+- **LLM 用量统计**：每次分析显示 token 消耗与请求次数，成本一目了然
 - **报告导出**：分析报告、原始数据均可导出为文件
 
 ## 快速开始
@@ -69,17 +73,23 @@ pyinstaller --onefile --windowed --name "声呐Sonar" main.py
 
 ```
 ├── main.py               # 主程序（GUI）
-├── llm_analyzer.py       # LLM 分析核心（函数调用循环 + 三种分析模式）
-├── bilibili_collector.py # B站采集（搜索/评论/视频详情，WBI签名）
-├── tieba_collector.py    # 贴吧采集（搜索/回复）
+├── llm_analyzer.py       # LLM 分析核心（函数调用循环 + 流式输出 + 三种分析模式）
+├── bilibili_collector.py # B站采集（搜索/评论/视频详情，WBI签名，风控退避）
+├── tieba_collector.py    # 贴吧采集（搜索/回复，安全验证检测）
 ├── cookie_helper.py      # 一键获取 Cookie（浏览器 Cookie 提取）
-├── config_manager.py     # 配置持久化
+├── config_manager.py     # 配置持久化（~/.sonar/config.json）
+├── md_render.py          # Markdown 报告渲染器
+├── history.py            # 分析历史归档
 └── requirements.txt      # 依赖清单
 ```
 
+## 更新记录
+
+- **v0.2.0**：稳定性大修 + 体验增强，详见 [CHANGELOG.md](CHANGELOG.md)
+
 ## 注意事项
 
-- 数据采集依赖 Cookie，评论接口对未登录用户有限制；Cookie 仅保存在本地 `config.json`（已被 .gitignore 排除，不会上传）
+- 数据采集依赖 Cookie，评论接口对未登录用户有限制；Cookie 仅保存在本地 `~/.sonar/config.json`（已被 .gitignore 排除，不会上传）
 - 请合理控制采集频率，本项目仅供学习研究，请勿用于商业用途或恶意刷量
 - LLM 分析质量取决于所配置的模型能力，推荐使用支持函数调用的模型
 
