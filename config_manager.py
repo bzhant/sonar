@@ -1,8 +1,26 @@
 """配置管理模块 - 存储 Cookie、LLM API 设置等"""
 import json
 import os
+import shutil
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# 配置存放在用户主目录，保证 PyInstaller onefile 冻结 exe 下也能持久化
+# （onefile 场景中脚本目录是运行时临时解压目录，退出后即被丢弃）
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".sonar")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+# 旧位置：脚本所在目录（用于迁移已存在的用户配置）
+_LEGACY_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+
+def _migrate_legacy_config():
+    """旧位置的配置存在且新位置尚无配置时，迁移到用户目录"""
+    if os.path.exists(CONFIG_FILE) or not os.path.exists(_LEGACY_CONFIG_FILE):
+        return
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        shutil.copyfile(_LEGACY_CONFIG_FILE, CONFIG_FILE)
+    except OSError:
+        pass
 
 DEFAULT_CONFIG = {
     "bilibili": {
@@ -41,6 +59,7 @@ class ConfigManager:
 
     def load(self):
         """从文件加载配置，不存在则用默认配置"""
+        _migrate_legacy_config()
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -52,6 +71,7 @@ class ConfigManager:
 
     def save(self):
         """保存配置到文件"""
+        os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(self.config, f, ensure_ascii=False, indent=2)
 

@@ -22,6 +22,20 @@ DEFAULT_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
+REQUEST_TIMEOUT = 15  # 所有请求的超时时间（秒），防止线程被挂起的请求卡死
+
+# WBI 密钥每日轮换，缓存超过该时长后重新获取
+WBI_CACHE_TTL = 12 * 3600
+
+# 相邻两次请求的最小间隔（秒），降低触发风控的概率
+MIN_REQUEST_INTERVAL = 0.6
+
+# 风控返回码：-412/-509 为接口返回，412/509 为 HTTP 状态码
+RISK_CONTROL_CODES = (-412, 412, -509, 509)
+
+# 触发风控后的退避基数（秒），按尝试次数递增
+RISK_BACKOFF_BASE = 2
+
 
 class BilibiliCollector:
     """B站数据采集器"""
@@ -33,15 +47,47 @@ class BilibiliCollector:
         if cookie_str:
             self.session.headers["Cookie"] = cookie_str
         self._wbi_keys = None  # 缓存 wbi img_key 和 sub_key
+        self._wbi_keys_time = 0.0  # 密钥获取时间，用于过期判断
+        self.min_request_interval = MIN_REQUEST_INTERVAL
+        self._last_request_ts = 0.0
+
+    # ========== 请求基础设施 ==========
+
+    def _get(self, url, params=None):
+        """限流 GET：保证相邻请求不小于最小间隔"""
+        wait = self._last_request_ts + self.min_request_interval - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        self._last_request_ts = time.time()
+        return self.session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+
+    def _get_json(self, url, params=None, retries=2):
+        """GET 并解析 JSON；触发风控返回码时按指数退避重试。返回原始 data dict（调用方检查 code）"""
+        last = {"code": -1, "message": "未知错误"}
+        for attempt in range(retries + 1):
+            resp = self._get(url, params)
+            if resp.status_code in (412, 509):
+                last = {"code": resp.status_code, "message": "HTTP状态码异常（疑似风控拦截）"}
+            else:
+                try:
+                    last = resp.json()
+                except ValueError:
+                    last = {"code": -1, "message": "响应不是有效JSON"}
+            if last.get("code") == 0:
+                return last
+            if last.get("code") in RISK_CONTROL_CODES and attempt < retries:
+                time.sleep(RISK_BACKOFF_BASE * (attempt + 1))
+                continue
+            break
+        return last
 
     # ========== WBI 签名 ==========
 
     def _get_wbi_keys(self):
         """从导航接口获取 img_key 和 sub_key"""
-        if self._wbi_keys:
+        if self._wbi_keys and time.time() - self._wbi_keys_time < WBI_CACHE_TTL:
             return self._wbi_keys
-        resp = self.session.get("https://api.bilibili.com/x/web-interface/nav")
-        data = resp.json()
+        data = self._get_json("https://api.bilibili.com/x/web-interface/nav", retries=1)
         if data.get("code") != 0:
             raise Exception(f"获取WBI密钥失败: {data.get('message', '未知错误')}")
         img_url = data["data"]["wbi_img"]["img_url"]
@@ -49,7 +95,13 @@ class BilibiliCollector:
         img_key = img_url.rsplit("/", 1)[-1].split(".")[0]
         sub_key = sub_url.rsplit("/", 1)[-1].split(".")[0]
         self._wbi_keys = (img_key, sub_key)
+        self._wbi_keys_time = time.time()
         return self._wbi_keys
+
+    def _invalidate_wbi_keys(self):
+        """清空缓存的 WBI 密钥（密钥可能已轮换）"""
+        self._wbi_keys = None
+        self._wbi_keys_time = 0.0
 
     def _get_mixin_key(self, raw_key):
         """用重排表生成 mixin_key"""
@@ -78,19 +130,22 @@ class BilibiliCollector:
         :param order: 排序方式 totalrank/pubdate/play/review/dm
         :return: 视频信息列表
         """
-        params = {
-            "search_type": "video",
-            "keyword": keyword,
-            "page": page,
-            "order": order,
-            "page_size": 20,
-        }
-        params = self._sign_wbi(params)
         url = "https://api.bilibili.com/x/web-interface/wbi/search/type"
-        resp = self.session.get(url, params=params)
-        data = resp.json()
-
-        if data.get("code") != 0:
+        for attempt in range(2):
+            params = self._sign_wbi({
+                "search_type": "video",
+                "keyword": keyword,
+                "page": page,
+                "order": order,
+                "page_size": 20,
+            })
+            data = self._get_json(url, params)
+            if data.get("code") == 0:
+                break
+            if attempt == 0:
+                # 签名失败可能是 WBI 密钥已轮换，刷新后重试一次（风控退避已在 _get_json 内处理）
+                self._invalidate_wbi_keys()
+                continue
             raise Exception(f"B站搜索失败: {data.get('message', '未知错误')}")
 
         results = []
@@ -122,12 +177,13 @@ class BilibiliCollector:
 
     # ========== 获取视频评论 ==========
 
-    def get_video_comments(self, aid, page=1, ps=20):
+    def get_video_comments(self, aid, page=1, ps=20, sort=0):
         """
         获取视频评论
         :param aid: 视频 av 号
         :param page: 页码
         :param ps: 每页数量
+        :param sort: 排序方式 0=按时间, 2=按热度
         :return: 评论列表
         """
         params = {
@@ -135,14 +191,15 @@ class BilibiliCollector:
             "oid": aid,
             "pn": page,
             "ps": ps,
-            "sort": 0,  # 0=按时间, 2=按热度
+            "sort": sort,
         }
         url = "https://api.bilibili.com/x/v2/reply"
-        resp = self.session.get(url, params=params)
-        data = resp.json()
+        data = self._get_json(url, params)
 
         if data.get("code") != 0:
-            # 评论区可能关闭，返回空列表
+            if data.get("code") in RISK_CONTROL_CODES:
+                raise Exception(f"获取评论被风控拦截(code {data.get('code')})，请降低频率或配置Cookie后重试")
+            # 评论区可能关闭等其他情况，返回空列表
             return []
 
         replies = data.get("data", {}).get("replies") or []
@@ -200,8 +257,7 @@ class BilibiliCollector:
             params = {"aid": aid}
 
         url = "https://api.bilibili.com/x/web-interface/view"
-        resp = self.session.get(url, params=params)
-        data = resp.json()
+        data = self._get_json(url, params)
 
         if data.get("code") != 0:
             raise Exception(f"获取视频详情失败: {data.get('message', '未知错误')}")
@@ -215,7 +271,7 @@ class BilibiliCollector:
         try:
             tag_url = "https://api.bilibili.com/x/tag/archive/tags"
             tag_params = {"bvid": bvid} if bvid.startswith("BV") else {"aid": bvid.replace("av", "")}
-            tag_resp = self.session.get(tag_url, params=tag_params)
+            tag_resp = self._get(tag_url, params=tag_params)
             tag_data = tag_resp.json()
             if tag_data.get("code") == 0:
                 tags = [t.get("tag_name", "") for t in tag_data.get("data", [])]
@@ -249,8 +305,7 @@ class BilibiliCollector:
     def get_hot_searches(self):
         """获取B站热搜榜"""
         url = "https://api.bilibili.com/x/web-interface/search/square"
-        resp = self.session.get(url, params={"limit": 20})
-        data = resp.json()
+        data = self._get_json(url, {"limit": 20})
         if data.get("code") != 0:
             return []
         return [item.get("keyword", "") for item in data.get("data", {}).get("trending", {}).get("list", [])]

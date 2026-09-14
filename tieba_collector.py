@@ -14,6 +14,9 @@ DEFAULT_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
+# 相邻两次请求的最小间隔（秒），降低触发反爬的概率
+MIN_REQUEST_INTERVAL = 1.0
+
 
 class TiebaCollector:
     """贴吧数据采集器"""
@@ -24,11 +27,19 @@ class TiebaCollector:
         self.session.headers.update(DEFAULT_HEADERS)
         if cookie_str:
             self.session.headers["Cookie"] = cookie_str
+        self.min_request_interval = MIN_REQUEST_INTERVAL
+        self._last_request_ts = 0.0
 
     def _get(self, url, params=None):
-        """发起 GET 请求并返回 BeautifulSoup 对象"""
+        """限流 GET 并返回 BeautifulSoup 对象；检测到安全验证页时抛出异常"""
+        wait = self._last_request_ts + self.min_request_interval - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        self._last_request_ts = time.time()
         resp = self.session.get(url, params=params, timeout=15)
         resp.encoding = "utf-8"
+        if "安全验证" in resp.text:
+            raise Exception("贴吧返回安全验证页（疑似触发反爬），请降低采集频率或配置登录Cookie后重试")
         return BeautifulSoup(resp.text, "html.parser")
 
     # ========== 搜索帖子 ==========
